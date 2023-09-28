@@ -52,7 +52,7 @@ func backupAndroidDevice() {
 
 func copyFilesFromAndroid() {
 	// Define the source directory on your Android device and the destination directory on your PC
-	sourceDir := "." // Change this to the source directory on your Android device
+	sourceDir := "/storage/emulated/0/" // Change this to the source directory on your Android device
 	pcDestinationDir := "backups/files"
 
 	// Create the PC destination directory if it doesn't exist
