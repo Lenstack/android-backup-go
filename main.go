@@ -12,6 +12,12 @@ import (
 const adbPath = "platform-tools/adb.exe"
 
 func main() {
+	// Check if ADB exists at the specified path
+	if _, err := os.Stat(adbPath); os.IsNotExist(err) {
+		fmt.Println("ADB not found at", adbPath)
+		return
+	}
+
 	// Prompt the user to choose between backup and file copy
 	fmt.Println("Select an option:")
 	fmt.Println("1. Backup Android device")
@@ -21,6 +27,12 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Scan()
 	option := strings.TrimSpace(scanner.Text())
+
+	// Check if a device is connected
+	if !isDeviceConnected() {
+		fmt.Println("No device connected. Please connect your Android device and try again.")
+		return
+	}
 
 	switch option {
 	case "1":
@@ -32,16 +44,36 @@ func main() {
 	}
 }
 
+func isDeviceConnected() bool {
+	cmd := exec.Command(adbPath, "devices")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "device") && !strings.Contains(line, "List of devices") {
+			return true
+		}
+	}
+	return false
+}
+
 func backupAndroidDevice() {
-	// Define paths for backup and PC transfer
+	// Define paths for backup
 	backupDir := "backups"
 	backupName := "backup.ab"
 	backupPath := filepath.Join(backupDir, backupName)
 
+	// Create the backup directory if it doesn't exist
+	if err := os.MkdirAll(backupDir, os.ModePerm); err != nil {
+		fmt.Printf("Error creating backup directory: %v\n", err)
+		return
+	}
+
 	fmt.Println("Creating backup of Android device")
 	// Create a backup using ADB
 	adbCommand := exec.Command(adbPath, "backup", "-f", backupPath, "-all")
-
 	if err := adbCommand.Run(); err != nil {
 		fmt.Printf("Error creating backup: %v\n", err)
 		return
