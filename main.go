@@ -56,13 +56,14 @@ func (c *Cache) Close() error {
 	return c.logFile.Close()
 }
 
-// AddFailed adds a failed operation to the cache and logs it.
-func (c *Cache) AddFailed(key string) {
+// AddFailed adds a failed operation to the cache and logs it with type and error.
+func (c *Cache) AddFailed(key, opType string, attempt int, err error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
-	c.failedOps[key]++
-	if c.failedOps[key] <= c.maxRetries {
-		fmt.Fprintf(c.logFile, "[%s] Failed attempt %d for %s\n", time.Now().Format(time.RFC3339), c.failedOps[key], key)
+	c.failedOps[key] = attempt
+	if attempt <= c.maxRetries {
+		fmt.Fprintf(c.logFile, "[%s] Type: %s, Key: %s, Attempt: %d, Error: %v\n",
+			time.Now().Format(time.RFC3339), opType, key, attempt, err)
 	}
 }
 
@@ -95,7 +96,7 @@ func NewConfig() *Config {
 		TimeoutLong:   2 * time.Hour,
 		LogFile:       "backups/backup_errors.log",
 		Concurrency:   runtime.NumCPU(),
-		MaxRetries:    3,
+		MaxRetries:    1,
 		RetryDelay:    1 * time.Second,
 		BackoffFactor: 2.0,
 	}
@@ -115,12 +116,13 @@ type AdbCommand struct {
 	Args    []string
 	Timeout time.Duration
 	Key     string // Unique identifier for caching (e.g., file path or command description)
+	Type    string // Operation type ("File" or "Command")
 }
 
 // run executes an ADB command with retries and exponential backoff.
 func (cfg *Config) run(cmd AdbCommand, cache *Cache) error {
 	var lastErr error
-	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
+	for attempt := 1; attempt <= cfg.MaxRetries+1; attempt++ {
 		if cache != nil && cache.ShouldSkip(cmd.Key) {
 			return fmt.Errorf("skipped %s after %d retries", cmd.Key, cfg.MaxRetries)
 		}
@@ -137,13 +139,13 @@ func (cfg *Config) run(cmd AdbCommand, cache *Cache) error {
 
 		lastErr = fmt.Errorf("ADB command %v failed: %w", cmd.Args, err)
 		if cache != nil {
-			cache.AddFailed(cmd.Key)
+			cache.AddFailed(cmd.Key, cmd.Type, attempt, lastErr)
 		}
-		fmt.Fprintf(os.Stderr, "Attempt %d/%d failed for %s: %v\n", attempt+1, cfg.MaxRetries, cmd.Key, err)
+		fmt.Fprintf(os.Stderr, "Attempt %d/%d failed for %s: %v\n", attempt, cfg.MaxRetries, cmd.Key, err)
 
 		// Apply exponential backoff
-		if attempt < cfg.MaxRetries {
-			delay := float64(cfg.RetryDelay) * math.Pow(cfg.BackoffFactor, float64(attempt))
+		if attempt <= cfg.MaxRetries {
+			delay := float64(cfg.RetryDelay) * math.Pow(cfg.BackoffFactor, float64(attempt-1))
 			time.Sleep(time.Duration(delay))
 		}
 	}
@@ -164,6 +166,7 @@ func (cfg *Config) startAdbServer(cache *Cache) error {
 		Args:    []string{"start-server"},
 		Timeout: cfg.TimeoutShort,
 		Key:     "start-server",
+		Type:    "Command",
 	}, cache)
 }
 
@@ -173,6 +176,7 @@ func (cfg *Config) waitForDevice(cache *Cache) error {
 		Args:    []string{"wait-for-device"},
 		Timeout: cfg.TimeoutShort,
 		Key:     "wait-for-device",
+		Type:    "Command",
 	}, cache)
 }
 
@@ -187,6 +191,7 @@ func (cfg *Config) backupDevice(cache *Cache) error {
 		Args:    []string{"backup", "-f", backupFile, "-all", "-apk", "-shared"},
 		Timeout: cfg.TimeoutLong,
 		Key:     backupFile,
+		Type:    "File",
 	}, cache)
 }
 
@@ -197,12 +202,12 @@ func (cfg *Config) listFiles(src string, cache *Cache) ([]string, error) {
 		Args:    []string{"shell", "find", src, "-type", "f"},
 		Timeout: cfg.TimeoutShort,
 		Key:     "list-files-" + src,
+		Type:    "Command",
 	}, cache)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list files in %s: %w", src, err)
 	}
 
-	// Execute command again to capture output
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TimeoutShort)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, cfg.AdbPath, "shell", "find", src, "-type", "f")
@@ -228,7 +233,7 @@ func (cfg *Config) copyFile(src, dst string, cache *Cache, wg *sync.WaitGroup, s
 
 	dstPath := filepath.Join(dst, strings.ReplaceAll(src, "/", "_"))
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
-		cache.AddFailed(src)
+		cache.AddFailed(src, "File", 1, err)
 		return fmt.Errorf("failed to create destination directory for %s: %w", src, err)
 	}
 
@@ -237,6 +242,7 @@ func (cfg *Config) copyFile(src, dst string, cache *Cache, wg *sync.WaitGroup, s
 		Args:    []string{"pull", src, dstPath},
 		Timeout: cfg.TimeoutLong,
 		Key:     src,
+		Type:    "File",
 	}, cache)
 	if err != nil {
 		return fmt.Errorf("failed to copy %s: %w", src, err)
@@ -279,6 +285,7 @@ func (cfg *Config) copyFromDevice(cache *Cache) error {
 		Args:    []string{"shell", "ls", src},
 		Timeout: cfg.TimeoutShort,
 		Key:     "validate-" + src,
+		Type:    "Command",
 	}, cache)
 	if err != nil {
 		return fmt.Errorf("invalid source path %s: %w", src, err)
@@ -304,7 +311,6 @@ func (cfg *Config) copyFromDevice(cache *Cache) error {
 	// Retry failed files
 	if err := cfg.retryFailedFiles(dst, cache); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: retry phase had issues: %v\n", err)
-		// Continue despite retry errors
 	}
 
 	return nil
@@ -330,6 +336,7 @@ func (cfg *Config) restoreDevice(cache *Cache) error {
 		Args:    []string{"restore", backupFile},
 		Timeout: cfg.TimeoutLong,
 		Key:     backupFile,
+		Type:    "File",
 	}, cache)
 }
 
@@ -378,11 +385,9 @@ func main() {
 	}
 	if err := cfg.startAdbServer(cache); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to start ADB server: %v\n", err)
-		// Continue despite failure
 	}
 	if err := cfg.waitForDevice(cache); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: no device connected: %v\n", err)
-		// Continue to allow user to retry or connect device
 	}
 
 	choice, err := chooseOption("Select an option:", []string{
@@ -392,7 +397,7 @@ func main() {
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: invalid option selection: %v\n", err)
-		return // Exit gracefully
+		return
 	}
 
 	var actionErr error
@@ -407,7 +412,6 @@ func main() {
 	if actionErr != nil {
 		fmt.Fprintf(os.Stderr, "Warning: operation completed with errors: %v\n", actionErr)
 		fmt.Println("Check logs at", cfg.LogFile, "for details on failed operations.")
-		// Do not exit; inform user and continue
 	} else {
 		fmt.Println("Operation completed successfully.")
 	}
