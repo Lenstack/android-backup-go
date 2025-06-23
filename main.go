@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,214 +14,179 @@ import (
 	"time"
 )
 
-const (
-	adbPath    = "platform-tools/adb.exe"
-	maxAdbWait = 5 * time.Second
-)
+// Config holds program-wide configuration.
+type Config struct {
+	AdbPath      string
+	BackupDir    string
+	TimeoutShort time.Duration
+	TimeoutLong  time.Duration
+}
+
+// NewConfig initializes the configuration with defaults and parsed flags.
+func NewConfig() *Config {
+	cfg := &Config{
+		AdbPath:      "platform-tools/adb.exe",
+		BackupDir:    "backups",
+		TimeoutShort: 10 * time.Second,
+		TimeoutLong:  2 * time.Hour,
+	}
+	flag.StringVar(&cfg.AdbPath, "adb", cfg.AdbPath, "path to ADB executable")
+	flag.Parse()
+	return cfg
+}
+
+// AdbCommand represents an ADB command with arguments and timeout.
+type AdbCommand struct {
+	Args    []string
+	Timeout time.Duration
+}
+
+// run executes an ADB command with the given context and configuration.
+func (cfg *Config) run(cmd AdbCommand) error {
+	ctx, cancel := context.WithTimeout(context.Background(), cmd.Timeout)
+	defer cancel()
+	adbCmd := exec.CommandContext(ctx, cfg.AdbPath, cmd.Args...)
+	adbCmd.Stdout = os.Stdout
+	adbCmd.Stderr = os.Stderr
+	if err := adbCmd.Run(); err != nil {
+		return fmt.Errorf("ADB command %v failed: %w", cmd.Args, err)
+	}
+	return nil
+}
+
+// checkAdb validates the ADB executable path.
+func (cfg *Config) checkAdb() error {
+	if _, err := os.Stat(cfg.AdbPath); os.IsNotExist(err) {
+		return fmt.Errorf("ADB executable not found at %s", cfg.AdbPath)
+	}
+	return nil
+}
+
+// startAdbServer starts the ADB server.
+func (cfg *Config) startAdbServer() error {
+	return cfg.run(AdbCommand{Args: []string{"start-server"}, Timeout: cfg.TimeoutShort})
+}
+
+// waitForDevice waits for an ADB device to be connected.
+func (cfg *Config) waitForDevice() error {
+	return cfg.run(AdbCommand{Args: []string{"wait-for-device"}, Timeout: cfg.TimeoutShort})
+}
+
+// backupDevice creates a backup of the Android device.
+func (cfg *Config) backupDevice() error {
+	if err := os.MkdirAll(cfg.BackupDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create backup directory: %w", err)
+	}
+	backupFile := filepath.Join(cfg.BackupDir, fmt.Sprintf("backup_%s.ab", time.Now().Format("20060102_150405")))
+	fmt.Printf("Backing up to %s\n", backupFile)
+	return cfg.run(AdbCommand{
+		Args:    []string{"backup", "-f", backupFile, "-all", "-apk", "-shared"},
+		Timeout: cfg.TimeoutLong,
+	})
+}
+
+// copyFromDevice copies files from the device to the local machine.
+func (cfg *Config) copyFromDevice() error {
+	const defaultSrc = "/storage/emulated/0/"
+	src := prompt(fmt.Sprintf("Enter source path on device [%s]: ", defaultSrc))
+	if src == "" {
+		src = defaultSrc
+	}
+	// Validate source path
+	if err := cfg.run(AdbCommand{Args: []string{"shell", "ls", src}, Timeout: cfg.TimeoutShort}); err != nil {
+		return fmt.Errorf("invalid source path %s: %w", src, err)
+	}
+	dst := filepath.Join(cfg.BackupDir, "files", time.Now().Format("20060102_150405"))
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return fmt.Errorf("failed to create destination directory: %w", err)
+	}
+	fmt.Printf("Copying from %s to %s\n", src, dst)
+	return cfg.run(AdbCommand{Args: []string{"pull", src, dst}, Timeout: cfg.TimeoutLong})
+}
+
+// restoreDevice restores a backup to the Android device.
+func (cfg *Config) restoreDevice() error {
+	files, err := filepath.Glob(filepath.Join(cfg.BackupDir, "*.ab"))
+	if err != nil || len(files) == 0 {
+		return fmt.Errorf("no backup files found in %s: %w", cfg.BackupDir, err)
+	}
+	for i, f := range files {
+		fmt.Printf("%d) %s\n", i+1, filepath.Base(f))
+	}
+	choice := prompt("Enter number of backup to restore: ")
+	i, err := strconv.Atoi(choice)
+	if err != nil || i < 1 || i > len(files) {
+		return errors.New("invalid backup selection")
+	}
+	backupFile := files[i-1]
+	fmt.Printf("Restoring from %s\n", backupFile)
+	return cfg.run(AdbCommand{Args: []string{"restore", backupFile}, Timeout: cfg.TimeoutLong})
+}
+
+// prompt reads a trimmed string from stdin with the given message.
+func prompt(msg string) string {
+	fmt.Print(msg)
+	scanner := bufio.NewScanner(os.Stdin)
+	if scanner.Scan() {
+		return strings.TrimSpace(scanner.Text())
+	}
+	return ""
+}
+
+// chooseOption displays a menu and returns the user's selection.
+func chooseOption(header string, options []string) (int, error) {
+	fmt.Println(header)
+	for i, opt := range options {
+		fmt.Printf("%d) %s\n", i+1, opt)
+	}
+	for {
+		input := prompt("Enter choice: ")
+		choice, err := strconv.Atoi(input)
+		if err == nil && choice >= 1 && choice <= len(options) {
+			return choice, nil
+		}
+		fmt.Println("Invalid choice, try again.")
+	}
+}
+
+// exitError prints an error to stderr and exits with status code 1.
+func exitError(err error) {
+	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	os.Exit(1)
+}
 
 func main() {
-	// Check if ADB exists
-	if _, err := os.Stat(adbPath); os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Error: ADB not found at %s\n", adbPath)
-		os.Exit(1)
+	cfg := NewConfig()
+
+	if err := cfg.checkAdb(); err != nil {
+		exitError(err)
+	}
+	if err := cfg.startAdbServer(); err != nil {
+		exitError(err)
+	}
+	if err := cfg.waitForDevice(); err != nil {
+		exitError(errors.New("no device connected: enable USB debugging and reconnect"))
 	}
 
-	// Start ADB server
-	if err := startAdbServer(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to start ADB server: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Check for connected device
-	if !isDeviceConnected() {
-		fmt.Fprintf(os.Stderr, "Error: No device connected. Please connect an Android device with USB debugging enabled.\n")
-		os.Exit(1)
-	}
-
-	// Prompt user for option
-	fmt.Println("Select an option:")
-	fmt.Println("1. Backup Android device")
-	fmt.Println("2. Copy files/directories from Android device to PC")
-	fmt.Println("3. Restore Android device from backup")
-	fmt.Print("Enter the option number: ")
-
-	scanner := bufio.NewScanner(os.Stdin)
-	if !scanner.Scan() {
-		fmt.Fprintf(os.Stderr, "Error: Failed to read input\n")
-		os.Exit(1)
-	}
-	option := strings.TrimSpace(scanner.Text())
-
-	switch option {
-	case "1":
-		backupAndroidDevice()
-	case "2":
-		copyFilesFromAndroid()
-	case "3":
-		restoreAndroidDevice()
-	default:
-		fmt.Fprintf(os.Stderr, "Error: Invalid option. Please choose 1, 2, or 3.\n")
-		os.Exit(1)
-	}
-}
-
-func startAdbServer() error {
-	cmd := exec.Command(adbPath, "start-server")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to start ADB server: %v", err)
-	}
-	time.Sleep(500 * time.Millisecond)
-	return nil
-}
-
-func isDeviceConnected() bool {
-	deadline := time.Now().Add(maxAdbWait)
-	for time.Now().Before(deadline) {
-		cmd := exec.Command(adbPath, "devices")
-		output, err := cmd.Output()
-		if err != nil {
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		lines := strings.Split(string(output), "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "\tdevice") && !strings.Contains(line, "List of devices") {
-				return true
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return false
-}
-
-func verifySourcePath(sourceDir string) error {
-	cmd := exec.Command(adbPath, "shell", "ls", sourceDir)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("source directory %s does not exist or is inaccessible", sourceDir)
-	}
-	return nil
-}
-
-func backupAndroidDevice() {
-	backupDir := "backups"
-	backupName := fmt.Sprintf("backup_%s.ab", time.Now().Format("20060102_150405"))
-	backupPath := filepath.Join(backupDir, backupName)
-
-	if err := os.MkdirAll(backupDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to create backup directory: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Creating backup of Android device to %s\n", backupPath)
-	cmd := exec.Command(adbPath, "backup", "-f", backupPath, "-all", "-apk", "-shared")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to create backup: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Backup completed and saved to %s\n", backupPath)
-}
-
-func copyFilesFromAndroid() {
-	sourceDir := "/storage/emulated/0/"
-	pcDestinationDir := filepath.Join("backups", "files", time.Now().Format("20060102_150405"))
-
-	if err := verifySourcePath(sourceDir); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := os.MkdirAll(pcDestinationDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to create destination directory: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Copying files from %s to %s\n", sourceDir, pcDestinationDir)
-	cmd := exec.Command(adbPath, "pull", sourceDir, pcDestinationDir)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to copy files: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("Files copied successfully.")
-}
-
-func restoreAndroidDevice() {
-	backupDir := "backups"
-	fmt.Println("Available backup files:")
-	backupFiles, err := listBackupFiles(backupDir)
+	choice, err := chooseOption("Select an option:", []string{
+		"Backup Android device",
+		"Copy files/directories from device to PC",
+		"Restore Android device from backup",
+	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to list backup files: %v\n", err)
-		os.Exit(1)
-	}
-	if len(backupFiles) == 0 {
-		fmt.Fprintf(os.Stderr, "Error: No backup files found in %s\n", backupDir)
-		os.Exit(1)
+		exitError(err)
 	}
 
-	for i, file := range backupFiles {
-		fmt.Printf("%d. %s\n", i+1, file)
+	var actionErr error
+	switch choice {
+	case 1:
+		actionErr = cfg.backupDevice()
+	case 2:
+		actionErr = cfg.copyFromDevice()
+	case 3:
+		actionErr = cfg.restoreDevice()
 	}
-	fmt.Print("Enter the number of the backup file to restore: ")
-
-	scanner := bufio.NewScanner(os.Stdin)
-	if !scanner.Scan() {
-		fmt.Fprintf(os.Stderr, "Error: Failed to read input\n")
-		os.Exit(1)
+	if actionErr != nil {
+		exitError(actionErr)
 	}
-	choice := strings.TrimSpace(scanner.Text())
-	index, err := parseChoice(choice, len(backupFiles))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	backupPath := filepath.Join(backupDir, backupFiles[index-1])
-	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Error: Backup file %s does not exist\n", backupPath)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Restoring Android device from %s\n", backupPath)
-	cmd := exec.Command(adbPath, "restore", backupPath)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to restore backup: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("Restore completed successfully.")
-}
-
-func listBackupFiles(dir string) ([]string, error) {
-	var backups []string
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read directory %s: %v", dir, err)
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".ab") {
-			backups = append(backups, entry.Name())
-		}
-	}
-	return backups, nil
-}
-
-func parseChoice(choice string, max int) (int, error) {
-	n, err := fmt.Sscanf(choice, "%d", &choice)
-	if err != nil || n != 1 {
-		return 0, fmt.Errorf("invalid input: please enter a number")
-	}
-	if choiceInt, err := strconv.Atoi(choice); err == nil {
-		if choiceInt < 1 || choiceInt > max {
-			return 0, fmt.Errorf("invalid choice: please select a number between 1 and %d", max)
-		}
-		return choiceInt, nil
-	}
-	return 0, fmt.Errorf("invalid input: please enter a number")
 }
