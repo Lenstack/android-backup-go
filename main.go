@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -10,7 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
+	"regexp"
+	_ "runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,55 +21,188 @@ import (
 
 // Config holds program-wide configuration.
 type Config struct {
-	AdbPath       string
-	BackupDir     string
-	TimeoutShort  time.Duration
-	TimeoutLong   time.Duration
-	LogFile       string
-	Concurrency   int
-	MaxRetries    int
-	RetryDelay    time.Duration
-	BackoffFactor float64
+	AdbPath        string
+	BackupDir      string
+	TimeoutShort   time.Duration
+	TimeoutLong    time.Duration
+	LogFile        string
+	SkipListFile   string
+	Concurrency    int
+	MaxRetries     int
+	RetryDelay     time.Duration
+	BackoffFactor  float64
+	BatchSize      int // Number of files per batch for copying
+	MaxConcurrency int // Maximum concurrency for adaptive adjustment
 }
 
-// Cache manages failed operations with retry tracking and logging.
+// Trie represents a prefix trie for skip list lookups.
+type Trie struct {
+	isEnd bool
+	nodes map[rune]*Trie
+}
+
+func NewTrie() *Trie {
+	return &Trie{nodes: make(map[rune]*Trie)}
+}
+
+func (t *Trie) Insert(path string) {
+	node := t
+	for _, r := range path {
+		if node.nodes[r] == nil {
+			node.nodes[r] = NewTrie()
+		}
+		node = node.nodes[r]
+	}
+	node.isEnd = true
+}
+
+func (t *Trie) HasPrefix(path string) bool {
+	node := t
+	for _, r := range path {
+		if node.nodes[r] == nil {
+			return node.isEnd
+		}
+		node = node.nodes[r]
+	}
+	return true
+}
+
+// FileStatus represents the status of a file (success or error).
+type FileStatus struct {
+	Path  string
+	Error bool
+}
+
+// Cache manages failed operations, file statuses, and skip list.
 type Cache struct {
-	failedOps  map[string]int // Operation key -> retry count
+	failedOps  map[string]int        // Operation key -> retry count
+	fileStatus map[string]FileStatus // File path -> status
 	maxRetries int
 	mutex      sync.RWMutex
 	logFile    *os.File
+	logWriter  *bufio.Writer
+	logBuffer  []string // In-memory log buffer
+	skipFile   *os.File
+	skipWriter *bufio.Writer
+	skipTrie   *Trie // Trie for skip list
 }
 
-// NewCache initializes the failure cache with logging.
-func NewCache(logPath string, maxRetries int) (*Cache, error) {
+// NewCache initializes the failure cache with logging and skip list.
+func NewCache(logPath, skipPath string, maxRetries int) (*Cache, error) {
 	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open log file: %w", err)
 	}
-	return &Cache{
+	skipFile, err := os.OpenFile(skipPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		logFile.Close()
+		return nil, fmt.Errorf("failed to open skip list file: %w", err)
+	}
+	cache := &Cache{
 		failedOps:  make(map[string]int),
+		fileStatus: make(map[string]FileStatus),
 		maxRetries: maxRetries,
 		logFile:    logFile,
-	}, nil
+		logWriter:  bufio.NewWriter(logFile),
+		logBuffer:  make([]string, 0, 1000), // Pre-allocate buffer
+		skipFile:   skipFile,
+		skipWriter: bufio.NewWriter(skipFile),
+		skipTrie:   NewTrie(),
+	}
+	if err := cache.loadSkipList(); err != nil {
+		logFile.Close()
+		skipFile.Close()
+		return nil, fmt.Errorf("failed to load skip list: %w", err)
+	}
+	return cache, nil
 }
 
-// Close closes the log file.
+// loadSkipList reads the skip list file into the trie.
+func (c *Cache) loadSkipList() error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	file, err := os.Open(c.skipFile.Name())
+	if err != nil {
+		return fmt.Errorf("failed to open skip list file for reading: %w", err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		path := strings.TrimSpace(scanner.Text())
+		if path != "" {
+			c.skipTrie.Insert(path)
+		}
+	}
+	return scanner.Err()
+}
+
+// Close flushes buffers and closes files.
 func (c *Cache) Close() error {
-	return c.logFile.Close()
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	for _, entry := range c.logBuffer {
+		if _, err := c.logWriter.WriteString(entry); err != nil {
+			return fmt.Errorf("failed to write log buffer: %w", err)
+		}
+	}
+	if err := c.logWriter.Flush(); err != nil {
+		return fmt.Errorf("failed to flush log writer: %w", err)
+	}
+	if err := c.skipWriter.Flush(); err != nil {
+		return fmt.Errorf("failed to flush skip writer: %w", err)
+	}
+	logErr := c.logFile.Close()
+	skipErr := c.skipFile.Close()
+	if logErr != nil {
+		return fmt.Errorf("failed to close log file: %w", logErr)
+	}
+	if skipErr != nil {
+		return fmt.Errorf("failed to close skip list file: %w", skipErr)
+	}
+	return nil
 }
 
-// AddFailed adds a failed operation to the cache and logs it with type and error.
-func (c *Cache) AddFailed(key, opType string, attempt int, err error) {
+// AddFailed adds a failed operation to the cache and logs it.
+func (c *Cache) AddFailed(key, opType string, attempt int, err error, stderr string) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	c.failedOps[key] = attempt
 	if attempt <= c.maxRetries {
-		fmt.Fprintf(c.logFile, "[%s] Type: %s, Key: %s, Attempt: %d, Error: %v\n",
+		logEntry := fmt.Sprintf("[%s] Type: %s, Key: %s, Attempt: %d, Error: %v",
 			time.Now().Format(time.RFC3339), opType, key, attempt, err)
+		if stderr != "" {
+			logEntry += fmt.Sprintf(", Stderr: %s", strings.TrimSpace(stderr))
+		}
+		if attempt == c.maxRetries {
+			logEntry += ", Status: Skipped"
+		}
+		logEntry += "\n"
+		c.logBuffer = append(c.logBuffer, logEntry)
 	}
 }
 
-// ShouldSkip checks if an operation should be skipped based on retry count.
+// AddFileStatus caches a file's status and logs errors.
+func (c *Cache) AddFileStatus(file FileStatus) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.fileStatus[file.Path] = file
+	if file.Error {
+		c.skipTrie.Insert(file.Path)
+		c.skipWriter.WriteString(file.Path + "\n")
+		logEntry := fmt.Sprintf("[%s] Type: FileError, Path: %s, Status: Permission Denied\n",
+			time.Now().Format(time.RFC3339), file.Path)
+		c.logBuffer = append(c.logBuffer, logEntry)
+	}
+}
+
+// IsPathInSkipList checks if a path is in the skip list using the trie.
+func (c *Cache) IsPathInSkipList(path string) bool {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c.skipTrie.HasPrefix(path)
+}
+
+// ShouldSkip checks if an operation should be skipped.
 func (c *Cache) ShouldSkip(key string) bool {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
@@ -90,24 +225,33 @@ func (c *Cache) GetFailed() []string {
 // NewConfig initializes the configuration with defaults and parsed flags.
 func NewConfig() *Config {
 	cfg := &Config{
-		AdbPath:       "platform-tools/adb.exe",
-		BackupDir:     "backups",
-		TimeoutShort:  10 * time.Second,
-		TimeoutLong:   2 * time.Hour,
-		LogFile:       "backups/backup_errors.log",
-		Concurrency:   runtime.NumCPU(),
-		MaxRetries:    1,
-		RetryDelay:    1 * time.Second,
-		BackoffFactor: 2.0,
+		AdbPath:        "platform-tools/adb.exe", // Default to PATH-based adb
+		BackupDir:      "backups",
+		TimeoutShort:   30 * time.Second,
+		TimeoutLong:    2 * time.Hour,
+		LogFile:        "backup_errors.log",
+		SkipListFile:   "skip_list.txt",
+		Concurrency:    10,
+		MaxRetries:     3,
+		RetryDelay:     1 * time.Second,
+		BackoffFactor:  2.0,
+		BatchSize:      100,
+		MaxConcurrency: 20,
 	}
 	flag.StringVar(&cfg.AdbPath, "adb", cfg.AdbPath, "path to ADB executable")
 	flag.StringVar(&cfg.BackupDir, "backup-dir", cfg.BackupDir, "backup directory")
 	flag.StringVar(&cfg.LogFile, "log", cfg.LogFile, "log file for failed operations")
-	flag.IntVar(&cfg.Concurrency, "concurrency", cfg.Concurrency, "number of concurrent operations")
-	flag.IntVar(&cfg.MaxRetries, "retries", cfg.MaxRetries, "maximum retry attempts for failed operations")
+	flag.StringVar(&cfg.SkipListFile, "skip-list", cfg.SkipListFile, "file for skipped paths")
+	flag.IntVar(&cfg.Concurrency, "concurrency", cfg.Concurrency, "initial number of concurrent operations")
+	flag.IntVar(&cfg.MaxRetries, "retries", cfg.MaxRetries, "maximum retry attempts")
 	flag.DurationVar(&cfg.RetryDelay, "retry-delay", cfg.RetryDelay, "initial delay between retries")
 	flag.Float64Var(&cfg.BackoffFactor, "backoff-factor", cfg.BackoffFactor, "exponential backoff factor")
+	flag.IntVar(&cfg.BatchSize, "batch-size", cfg.BatchSize, "number of files per batch")
+	flag.IntVar(&cfg.MaxConcurrency, "max-concurrency", cfg.MaxConcurrency, "maximum concurrency for adaptive adjustment")
 	flag.Parse()
+	if cfg.MaxConcurrency < cfg.Concurrency {
+		cfg.MaxConcurrency = cfg.Concurrency
+	}
 	return cfg
 }
 
@@ -115,41 +259,48 @@ func NewConfig() *Config {
 type AdbCommand struct {
 	Args    []string
 	Timeout time.Duration
-	Key     string // Unique identifier for caching (e.g., file path or command description)
-	Type    string // Operation type ("File" or "Command")
+	Key     string
+	Type    string
+	Path    string
 }
 
 // run executes an ADB command with retries and exponential backoff.
-func (cfg *Config) run(cmd AdbCommand, cache *Cache) error {
+func (cfg *Config) run(cmd AdbCommand, cache *Cache) (string, string, error) {
 	var lastErr error
-	for attempt := 1; attempt <= cfg.MaxRetries+1; attempt++ {
+	var stdoutBuf, stderrBuf bytes.Buffer
+	for attempt := 1; attempt <= cfg.MaxRetries; attempt++ {
 		if cache != nil && cache.ShouldSkip(cmd.Key) {
-			return fmt.Errorf("skipped %s after %d retries", cmd.Key, cfg.MaxRetries)
+			return stdoutBuf.String(), stderrBuf.String(), fmt.Errorf("skipped %s after %d retries", cmd.Key, cfg.MaxRetries)
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), cmd.Timeout)
 		defer cancel()
 		adbCmd := exec.CommandContext(ctx, cfg.AdbPath, cmd.Args...)
-		adbCmd.Stdout = os.Stdout
-		adbCmd.Stderr = os.Stderr
+		adbCmd.Stdout = &stdoutBuf
+		adbCmd.Stderr = &stderrBuf
 		err := adbCmd.Run()
 		if err == nil {
-			return nil // Success
+			return stdoutBuf.String(), stderrBuf.String(), nil
 		}
 
 		lastErr = fmt.Errorf("ADB command %v failed: %w", cmd.Args, err)
+		stderrStr := stderrBuf.String()
 		if cache != nil {
-			cache.AddFailed(cmd.Key, cmd.Type, attempt, lastErr)
+			if strings.Contains(strings.ToLower(stderrStr), "permission denied") {
+				cache.AddFileStatus(FileStatus{Path: cmd.Path, Error: true})
+				return stdoutBuf.String(), stderrStr, lastErr
+			}
+			cache.AddFailed(cmd.Key, cmd.Type, attempt, lastErr, stderrStr)
 		}
-		fmt.Fprintf(os.Stderr, "Attempt %d/%d failed for %s: %v\n", attempt, cfg.MaxRetries, cmd.Key, err)
+		fmt.Fprintf(os.Stderr, "Attempt %d/%d failed for %s: %v, Stderr: %s\n",
+			attempt, cfg.MaxRetries, cmd.Key, lastErr, strings.TrimSpace(stderrStr))
 
-		// Apply exponential backoff
-		if attempt <= cfg.MaxRetries {
+		if attempt < cfg.MaxRetries {
 			delay := float64(cfg.RetryDelay) * math.Pow(cfg.BackoffFactor, float64(attempt-1))
 			time.Sleep(time.Duration(delay))
 		}
 	}
-	return lastErr // Return last error if all retries fail
+	return stdoutBuf.String(), stderrBuf.String(), lastErr
 }
 
 // checkAdb validates the ADB executable path.
@@ -160,163 +311,392 @@ func (cfg *Config) checkAdb() error {
 	return nil
 }
 
+// checkDeviceConnectivity verifies if a device is connected.
+func (cfg *Config) checkDeviceConnectivity(cache *Cache) error {
+	_, _, err := cfg.run(AdbCommand{
+		Args:    []string{"devices"},
+		Timeout: cfg.TimeoutShort,
+		Key:     "check-devices",
+		Type:    "Command",
+		Path:    "",
+	}, cache)
+	return err
+}
+
 // startAdbServer starts the ADB server with retries.
 func (cfg *Config) startAdbServer(cache *Cache) error {
-	return cfg.run(AdbCommand{
+	_, _, err := cfg.run(AdbCommand{
 		Args:    []string{"start-server"},
 		Timeout: cfg.TimeoutShort,
 		Key:     "start-server",
 		Type:    "Command",
+		Path:    "",
 	}, cache)
+	return err
 }
 
-// waitForDevice waits for an ADB device to be connected with retries.
+// waitForDevice waits for an ADB device to be connected.
 func (cfg *Config) waitForDevice(cache *Cache) error {
-	return cfg.run(AdbCommand{
+	_, _, err := cfg.run(AdbCommand{
 		Args:    []string{"wait-for-device"},
 		Timeout: cfg.TimeoutShort,
 		Key:     "wait-for-device",
 		Type:    "Command",
+		Path:    "",
 	}, cache)
+	return err
 }
 
-// backupDevice creates a backup of the Android device with retries.
+// backupDevice creates a backup of the Android device.
 func (cfg *Config) backupDevice(cache *Cache) error {
 	if err := os.MkdirAll(cfg.BackupDir, 0o755); err != nil {
 		return fmt.Errorf("failed to create backup directory: %w", err)
 	}
 	backupFile := filepath.Join(cfg.BackupDir, fmt.Sprintf("backup_%s.ab", time.Now().Format("20060102_150405")))
 	fmt.Printf("Backing up to %s\n", backupFile)
-	return cfg.run(AdbCommand{
+	_, _, err := cfg.run(AdbCommand{
 		Args:    []string{"backup", "-f", backupFile, "-all", "-apk", "-shared"},
 		Timeout: cfg.TimeoutLong,
 		Key:     backupFile,
 		Type:    "File",
+		Path:    backupFile,
 	}, cache)
+	return err
 }
 
-// listFiles lists files in a directory on the device with retries.
+// listFiles lists files in a directory on the device, using parallel listing for subdirectories.
 func (cfg *Config) listFiles(src string, cache *Cache) ([]string, error) {
-	var files []string
-	err := cfg.run(AdbCommand{
-		Args:    []string{"shell", "find", src, "-type", "f"},
-		Timeout: cfg.TimeoutShort,
-		Key:     "list-files-" + src,
-		Type:    "Command",
-	}, cache)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list files in %s: %w", src, err)
+	if cache.IsPathInSkipList(src) {
+		fmt.Fprintf(os.Stderr, "Warning: skipping path %s due to previous permission denied\n", src)
+		return []string{}, nil
 	}
 
+	// List subdirectories for parallel processing
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TimeoutShort)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, cfg.AdbPath, "shell", "find", src, "-type", "f")
-	output, err := cmd.Output()
+	cmd := exec.CommandContext(ctx, cfg.AdbPath, "shell", "find", src, "-maxdepth", "1", "-type", "d")
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	err := cmd.Run()
 	if err != nil {
-		return nil, fmt.Errorf("failed to capture file list in %s: %w", src, err)
+		cache.AddFailed("list-dirs-"+src, "Command", 1, err, stderrBuf.String())
+		fmt.Fprintf(os.Stderr, "Warning: failed to list directories in %s: %v, stderr: %s\n", src, err, stderrBuf.String())
+		return cfg.listFilesSingleCtx(ctx, src, cache)
 	}
 
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	// Parse subdirectories
+	var subdirs []string
+	scanner := bufio.NewScanner(strings.NewReader(stdoutBuf.String()))
+	for scanner.Scan() {
+		dir := strings.TrimSpace(scanner.Text())
+		if dir != "" && dir != src && !cache.IsPathInSkipList(dir) {
+			subdirs = append(subdirs, dir)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to scan subdirectories: %w", err)
+	}
+
+	// Process subdirectories in parallel
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var allFiles []string
+	var errs []error
+	sem := make(chan struct{}, cfg.Concurrency)
+	for _, subdir := range append(subdirs, src) {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			files, err := cfg.listFilesSingleCtx(ctx, path, cache)
+			mu.Lock()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("failed to list %s: %w", path, err))
+			}
+			allFiles = append(allFiles, files...)
+			mu.Unlock()
+		}(subdir)
+	}
+	wg.Wait()
+
+	if len(errs) > 0 {
+		return allFiles, errors.Join(errs...)
+	}
+	return allFiles, nil
+}
+
+// listFilesSingleCtx lists files in a single directory with context.
+func (cfg *Config) listFilesSingleCtx(ctx context.Context, src string, cache *Cache) ([]string, error) {
+	cmd := exec.CommandContext(ctx, cfg.AdbPath, "shell", "find", src, "-type", "f")
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	err := cmd.Run()
+
+	// Parse stderr for permission-denied paths
+	deniedPaths := parsePermissionDeniedPaths(stderrBuf.String())
+	for _, path := range deniedPaths {
+		cache.AddFileStatus(FileStatus{Path: path, Error: true})
+		fmt.Fprintf(os.Stderr, "Warning: permission denied for %s, marked as unprocessable\n", path)
+	}
+
+	// Cache all files
+	var files []string
+	scanner := bufio.NewScanner(strings.NewReader(stdoutBuf.String()))
 	for scanner.Scan() {
 		file := strings.TrimSpace(scanner.Text())
 		if file != "" {
-			files = append(files, file)
+			hasError := cache.IsPathInSkipList(file)
+			cache.AddFileStatus(FileStatus{Path: file, Error: hasError})
+			if !hasError {
+				files = append(files, file)
+			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return files, fmt.Errorf("failed to scan files: %w", err)
+	}
+
+	if err != nil {
+		cache.AddFailed("list-files-"+src, "Command", 1, err, stderrBuf.String())
+		fmt.Fprintf(os.Stderr, "Warning: errors encountered listing files in %s: %v, stderr: %s\n", src, err, stderrBuf.String())
+		return files, nil
 	}
 	return files, nil
 }
 
-// copyFile pulls a single file from the device with retry logic.
-func (cfg *Config) copyFile(src, dst string, cache *Cache, wg *sync.WaitGroup, sem chan struct{}) error {
-	defer wg.Done()
-	defer func() { <-sem }() // Release semaphore
-
-	dstPath := filepath.Join(dst, strings.ReplaceAll(src, "/", "_"))
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
-		cache.AddFailed(src, "File", 1, err)
-		return fmt.Errorf("failed to create destination directory for %s: %w", src, err)
+// parsePermissionDeniedPaths extracts permission-denied paths from stderr.
+func parsePermissionDeniedPaths(stderr string) []string {
+	var paths []string
+	re := regexp.MustCompile(`find:\s*(.*?):\s*Permission denied`)
+	matches := re.FindAllStringSubmatch(stderr, -1)
+	for _, match := range matches {
+		if len(match) > 1 {
+			path := strings.TrimSpace(match[1])
+			if path != "" {
+				paths = append(paths, path)
+			}
+		}
 	}
-
-	fmt.Printf("Copying %s to %s\n", src, dstPath)
-	err := cfg.run(AdbCommand{
-		Args:    []string{"pull", src, dstPath},
-		Timeout: cfg.TimeoutLong,
-		Key:     src,
-		Type:    "File",
-	}, cache)
-	if err != nil {
-		return fmt.Errorf("failed to copy %s: %w", src, err)
-	}
-	return nil
+	return paths
 }
 
-// retryFailedFiles retries failed file copies.
-func (cfg *Config) retryFailedFiles(dst string, cache *Cache) error {
-	failed := cache.GetFailed()
-	if len(failed) == 0 {
-		fmt.Println("No files to retry.")
+// copyFilesBatch copies a batch of files using compressed tar.
+func (cfg *Config) copyFilesBatch(files []string, dst, rootSrc string, cache *Cache, wg *sync.WaitGroup, sem chan struct{}) error {
+	defer wg.Done()
+	defer func() { <-sem }()
+
+	if len(files) == 0 {
 		return nil
 	}
 
-	fmt.Printf("Retrying %d failed files\n", len(failed))
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, cfg.Concurrency)
+	// Create temporary tar file on device
+	tmpTar := fmt.Sprintf("/data/local/tmp/backup_%d.tar.gz", time.Now().UnixNano())
+	defer func() {
+		_, _, err := cfg.run(AdbCommand{
+			Args:    []string{"shell", "rm", "-f", tmpTar},
+			Timeout: cfg.TimeoutShort,
+			Key:     "cleanup-" + tmpTar,
+			Type:    "Command",
+			Path:    tmpTar,
+		}, cache)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to cleanup %s: %v\n", tmpTar, err)
+		}
+	}()
 
-	for _, src := range failed {
-		sem <- struct{}{} // Acquire semaphore
-		wg.Add(1)
-		go cfg.copyFile(src, dst, cache, &wg, sem)
+	// Create compressed tar archive
+	fileList := strings.Join(files, "\n")
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.TimeoutLong)
+	defer cancel()
+	tarCmd := exec.CommandContext(ctx, cfg.AdbPath, "shell", "tar", "-zcf", tmpTar, "-T", "-")
+	tarCmd.Stdin = strings.NewReader(fileList)
+	var stderrBuf bytes.Buffer
+	tarCmd.Stderr = &stderrBuf
+	err := tarCmd.Run()
+	if err != nil {
+		stderr := stderrBuf.String()
+		if strings.Contains(strings.ToLower(stderr), "permission denied") {
+			for _, file := range files {
+				cache.AddFileStatus(FileStatus{Path: file, Error: true})
+				fmt.Fprintf(os.Stderr, "Warning: permission denied for %s, marked as unprocessable\n", file)
+			}
+		}
+		return fmt.Errorf("failed to create tar archive: %w, stderr: %s", err, stderr)
 	}
 
-	wg.Wait()
-	return nil
-}
-
-// copyFromDevice copies files from the device to the local machine with concurrency and retries.
-func (cfg *Config) copyFromDevice(cache *Cache) error {
-	const defaultSrc = "/storage/emulated/0/"
-	src := prompt(fmt.Sprintf("Enter source path on device [%s]: ", defaultSrc))
-	if src == "" {
-		src = defaultSrc
-	}
-
-	// Validate source path with retries
-	err := cfg.run(AdbCommand{
-		Args:    []string{"shell", "ls", src},
-		Timeout: cfg.TimeoutShort,
-		Key:     "validate-" + src,
-		Type:    "Command",
+	// Pull tar archive
+	localTar := filepath.Join(dst, fmt.Sprintf("batch_%d.tar.gz", time.Now().UnixNano()))
+	_, stderr, err := cfg.run(AdbCommand{
+		Args:    []string{"pull", tmpTar, localTar},
+		Timeout: cfg.TimeoutLong,
+		Key:     "pull-" + tmpTar,
+		Type:    "File",
+		Path:    tmpTar,
 	}, cache)
 	if err != nil {
-		return fmt.Errorf("invalid source path %s: %w", src, err)
+		return fmt.Errorf("failed to pull tar archive %s: %w, stderr: %s", tmpTar, err, stderr)
+	}
+	defer os.Remove(localTar)
+
+	// Extract tar archive
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return fmt.Errorf("failed to create destination directory %s: %w", dst, err)
+	}
+	untarCmd := exec.Command("tar", "-zxf", localTar, "-C", dst)
+	if err := untarCmd.Run(); err != nil {
+		return fmt.Errorf("failed to extract tar archive %s: %w", localTar, err)
 	}
 
-	dst := filepath.Join(cfg.BackupDir, "files", time.Now().Format("20060102_150405"))
-	// List files with retries
-	files, err := cfg.listFiles(src, cache)
-	if err != nil {
-		return fmt.Errorf("failed to list files: %w", err)
-	}
-
-	// Copy files concurrently
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, cfg.Concurrency)
+	// Log successful copies
 	for _, file := range files {
-		sem <- struct{}{} // Acquire semaphore
-		wg.Add(1)
-		go cfg.copyFile(file, dst, cache, &wg, sem)
-	}
-	wg.Wait()
-
-	// Retry failed files
-	if err := cfg.retryFailedFiles(dst, cache); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: retry phase had issues: %v\n", err)
+		relativePath, err := filepath.Rel(rootSrc, file)
+		dstPath := filepath.Join(dst, relativePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to relativize %s: %v, using basename\n", file, err)
+			dstPath = filepath.Join(dst, filepath.Base(file))
+		}
+		fmt.Printf("Copied %s to %s\n", file, dstPath)
 	}
 
 	return nil
 }
 
-// restoreDevice restores a backup to the Android device with retries.
+// copyFromDevice copies files with adaptive concurrency.
+func (cfg *Config) copyFromDevice(cache *Cache) error {
+	const defaultSrc = "/storage/emulated/0/"
+	alternativePaths := []string{"/sdcard/", "/mnt/sdcard/"}
+	attemptedPaths := make(map[string]bool)
+
+	for {
+		src := prompt(fmt.Sprintf("Enter source path on device [%s]: ", defaultSrc))
+		if src == "" {
+			src = defaultSrc
+		}
+		rootSrc := strings.TrimRight(src, "/")
+
+		if err := cfg.checkDeviceConnectivity(cache); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: device connectivity check failed: %v\n", err)
+		}
+
+		if attemptedPaths[src] {
+			fmt.Fprintf(os.Stderr, "Warning: path %s already attempted, please try a different path\n", src)
+			continue
+		}
+		attemptedPaths[src] = true
+
+		_, stderr, err := cfg.run(AdbCommand{
+			Args:    []string{"shell", "ls", src},
+			Timeout: cfg.TimeoutShort,
+			Key:     "validate-" + src,
+			Type:    "Command",
+			Path:    src,
+		}, cache)
+		if err != nil {
+			if strings.Contains(strings.ToLower(stderr), "permission denied") {
+				cache.AddFileStatus(FileStatus{Path: src, Error: true})
+				fmt.Fprintf(os.Stderr, "Warning: permission denied for %s, marked as unprocessable\n", src)
+			}
+			fmt.Fprintf(os.Stderr, "Warning: invalid source path %s: %v\n", src, err)
+			for _, altSrc := range alternativePaths {
+				if !attemptedPaths[altSrc] {
+					fmt.Printf("Trying alternative path: %s\n", altSrc)
+					src = altSrc
+					rootSrc = strings.TrimRight(altSrc, "/")
+					attemptedPaths[altSrc] = true
+					err = nil
+					break
+				}
+			}
+			if err != nil {
+				choice := prompt("Enter a new source path or press Enter to return to main menu: ")
+				if choice == "" {
+					return nil
+				}
+				src = choice
+				rootSrc = strings.TrimRight(src, "/")
+				continue
+			}
+		}
+
+		dst := filepath.Join(cfg.BackupDir, "files", time.Now().Format("20060102_150405"))
+		files, err := cfg.listFiles(src, cache)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to list files in %s: %v\n", src, err)
+			choice := prompt("Enter a new source path or press Enter to return to main menu: ")
+			if choice == "" {
+				return nil
+			}
+			src = choice
+			rootSrc = strings.TrimRight(src, "/")
+			continue
+		}
+
+		// Adaptive concurrency
+		concurrency := cfg.Concurrency
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, cfg.MaxConcurrency)
+		var mu sync.Mutex
+		avgDuration := 0.0
+		count := 0
+		for i := 0; i < len(files); i += cfg.BatchSize {
+			end := i + cfg.BatchSize
+			if end > len(files) {
+				end = len(files)
+			}
+			batch := files[i:end]
+			sem <- struct{}{}
+			wg.Add(1)
+			go func(b []string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				start := time.Now()
+				if err := cfg.copyFilesBatch(b, dst, rootSrc, cache, &wg, sem); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: batch copy failed: %v\n", err)
+				}
+				mu.Lock()
+				avgDuration = (avgDuration*float64(count) + float64(time.Since(start))) / float64(count+1)
+				count++
+				if avgDuration > float64(2*time.Second) && concurrency > 1 {
+					concurrency--
+				} else if avgDuration < float64(500*time.Millisecond) && concurrency < cfg.MaxConcurrency {
+					concurrency++
+				}
+				mu.Unlock()
+			}(batch)
+		}
+		wg.Wait()
+
+		// Retry failed files
+		failed := cache.GetFailed()
+		if len(failed) > 0 {
+			fmt.Printf("Retrying %d failed files\n", len(failed))
+			for i := 0; i < len(failed); i += cfg.BatchSize {
+				end := i + cfg.BatchSize
+				if end > len(failed) {
+					end = len(failed)
+				}
+				batch := failed[i:end]
+				sem <- struct{}{}
+				wg.Add(1)
+				go func(b []string) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					if err := cfg.copyFilesBatch(b, dst, rootSrc, cache, &wg, sem); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: batch copy failed: %v\n", err)
+					}
+				}(batch)
+			}
+			wg.Wait()
+		}
+
+		return nil
+	}
+}
+
+// restoreDevice restores a backup to the Android device.
 func (cfg *Config) restoreDevice(cache *Cache) error {
 	files, err := filepath.Glob(filepath.Join(cfg.BackupDir, "*.ab"))
 	if err != nil || len(files) == 0 {
@@ -332,15 +712,17 @@ func (cfg *Config) restoreDevice(cache *Cache) error {
 	}
 	backupFile := files[i-1]
 	fmt.Printf("Restoring from %s\n", backupFile)
-	return cfg.run(AdbCommand{
+	_, _, err = cfg.run(AdbCommand{
 		Args:    []string{"restore", backupFile},
 		Timeout: cfg.TimeoutLong,
 		Key:     backupFile,
 		Type:    "File",
+		Path:    backupFile,
 	}, cache)
+	return err
 }
 
-// prompt reads a trimmed string from stdin with the given message.
+// prompt reads a trimmed string from stdin.
 func prompt(msg string) string {
 	fmt.Print(msg)
 	scanner := bufio.NewScanner(os.Stdin)
@@ -366,7 +748,7 @@ func chooseOption(header string, options []string) (int, error) {
 	}
 }
 
-// exitError prints an error to stderr and exits with status code 1.
+// exitError prints an error and exits.
 func exitError(err error) {
 	fmt.Fprintf(os.Stderr, "Fatal error: %v\n", err)
 	os.Exit(1)
@@ -374,7 +756,7 @@ func exitError(err error) {
 
 func main() {
 	cfg := NewConfig()
-	cache, err := NewCache(cfg.LogFile, cfg.MaxRetries)
+	cache, err := NewCache(cfg.LogFile, cfg.SkipListFile, cfg.MaxRetries)
 	if err != nil {
 		exitError(err)
 	}
