@@ -545,7 +545,7 @@ func (cfg *Config) listFilesSingleCtx(ctx context.Context, src string, cache *Ca
 		}
 	} else {
 		cache.AddFailed("list-files-"+src, "Command", 1, err, stderrStr)
-		fmt.Fprintf(os.Stderr, "Warning: errors encountered listing files in %s: %v, stderr: %s\n", src, err, stderrStr)
+		fmt.Fprintf(os.Stderr, "Warning: failed to list files in %s: %v, stderr: %s\n", src, err, stderrStr)
 		return files, nil
 	}
 
@@ -575,7 +575,7 @@ func min(a, b int) int {
 	return b
 }
 
-// parsePermissionDeniedPaths extracts permission-denied paths from stderr.
+// parsePermissionDeniedPaths extracts paths from permission-denied errors.
 func parsePermissionDeniedPaths(stderr string) []string {
 	var paths []string
 	re := regexp.MustCompile(`find:\s*(.*?):\s*Permission denied|ls:\s*(.*?):\s*Permission denied`)
@@ -609,6 +609,43 @@ func SanitizePath(path string) (string, error) {
 	return cleaned, nil
 }
 
+// ensureTempDir creates and verifies a writable temporary directory on the device.
+func (cfg *Config) ensureTempDir(cache *Cache) (string, error) {
+	tempDir := "/sdcard/tmp"
+	// Create the directory
+	_, stderr, err := cfg.run(AdbCommand{
+		Args:    []string{"shell", "mkdir", "-p", tempDir},
+		Timeout: cfg.TimeoutList,
+		Key:     "mkdir-" + tempDir,
+		Type:    "Command",
+		Path:    tempDir,
+	}, cache)
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary directory %s: %w, stderr: %s; check device storage permissions", tempDir, err, stderr)
+	}
+	// Verify writability with a test file
+	testFile := filepath.Join(tempDir, "test_writable")
+	_, stderr, err = cfg.run(AdbCommand{
+		Args:    []string{"shell", "touch", testFile},
+		Timeout: cfg.TimeoutList,
+		Key:     "touch-" + testFile,
+		Type:    "Command",
+		Path:    testFile,
+	}, cache)
+	if err != nil {
+		return "", fmt.Errorf("temporary directory %s is not writable: %w, stderr: %s; ensure /sdcard has write permissions", tempDir, err, stderr)
+	}
+	// Clean up test file
+	cfg.run(AdbCommand{
+		Args:    []string{"shell", "rm", "-f", testFile},
+		Timeout: cfg.TimeoutCleanup,
+		Key:     "cleanup-" + testFile,
+		Type:    "Command",
+		Path:    testFile,
+	}, cache)
+	return tempDir, nil
+}
+
 // copyFilesBatch copies a batch of files using compressed tar with Windows compatibility.
 func (cfg *Config) copyFilesBatch(files []string, dst, rootSrc string, cache *Cache, wg *sync.WaitGroup, sem chan struct{}) error {
 	defer wg.Done()
@@ -620,14 +657,19 @@ func (cfg *Config) copyFilesBatch(files []string, dst, rootSrc string, cache *Ca
 		return fmt.Errorf("tar command not found: %w; install tar (e.g., via Git Bash or WSL)", err)
 	}
 	dst = filepath.Clean(dst)
+	// Ensure writable temporary directory
+	tempDir, err := cfg.ensureTempDir(cache)
+	if err != nil {
+		return err
+	}
 	tmpTarBase := fmt.Sprintf("backup_%d.tar.gz", time.Now().UnixNano())
-	tmpTar := filepath.Join("/data/local/tmp", tmpTarBase)
+	tmpTar := filepath.Join(tempDir, tmpTarBase)
 	if _, err := SanitizePath(tmpTar); err != nil {
 		return fmt.Errorf("invalid temporary tar path: %w", err)
 	}
 	var cleanupErr error
 	defer func() {
-		_, _, err := cfg.run(AdbCommand{
+		_, stderr, err := cfg.run(AdbCommand{
 			Args:    []string{"shell", "rm", "-f", tmpTar},
 			Timeout: cfg.TimeoutCleanup,
 			Key:     "cleanup-" + tmpTar,
@@ -635,7 +677,7 @@ func (cfg *Config) copyFilesBatch(files []string, dst, rootSrc string, cache *Ca
 			Path:    tmpTar,
 		}, cache)
 		if err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("failed to cleanup temporary tar file %s: %w", tmpTar, err))
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("failed to cleanup temporary tar file %s: %w, stderr: %s", tmpTar, err, stderr))
 			fmt.Fprintf(os.Stderr, "Warning: failed to cleanup %s: %v\n", tmpTar, err)
 		}
 	}()
@@ -668,17 +710,17 @@ func (cfg *Config) copyFilesBatch(files []string, dst, rootSrc string, cache *Ca
 	var tarStdout, tarStderr bytes.Buffer
 	tarCmd.Stdout = &tarStdout
 	tarCmd.Stderr = &tarStderr
-	err := tarCmd.Run()
+	err = tarCmd.Run()
 	if err != nil {
 		stderr := tarStderr.String()
-		if strings.Contains(strings.ToLower(stderr), "permission denied") {
+		if strings.Contains(strings.ToLower(stderr), "permission denied") || strings.Contains(strings.ToLower(stderr), "read-only") {
 			for _, file := range files {
 				cache.AddFileStatus(FileStatus{Path: file, Error: true})
-				fmt.Fprintf(os.Stderr, "Warning: permission denied for %s, marked as unprocessable\n", file)
+				fmt.Fprintf(os.Stderr, "Warning: permission or read-only issue for %s, marked as unprocessable\n", file)
 			}
 		}
 		cache.AddFailed("tar-create-"+tmpTar, "Command", 1, err, stderr)
-		return errors.Join(fmt.Errorf("failed to create tar archive %s: %w, stderr: %s", tmpTar, err, stderr), cleanupErr)
+		return errors.Join(fmt.Errorf("failed to create tar archive %s: %w, stderr: %s; check device storage permissions or try a different source path", tmpTar, err, stderr), cleanupErr)
 	}
 	localTar := filepath.Join(dst, fmt.Sprintf("batch_%d.tar.gz", time.Now().UnixNano()))
 	_, stderr, err := cfg.run(AdbCommand{
