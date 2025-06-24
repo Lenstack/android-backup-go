@@ -268,7 +268,7 @@ func NewConfig() *Config {
 	cfg := &Config{
 		AdbPath:        "platform-tools/adb.exe",
 		BackupDir:      "backups",
-		TemporaryDir:   "/sdcard/tmp",
+		TemporaryDir:   "/tmp/adb_backup",
 		TimeoutList:    30 * time.Second,
 		TimeoutCopy:    2 * time.Hour,
 		TimeoutCleanup: 10 * time.Second,
