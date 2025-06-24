@@ -815,12 +815,6 @@ func chooseOption(header string, options []string) (int, error) {
 	}
 }
 
-// exitError prints an error and exits.
-func exitError(err error) {
-	fmt.Fprintf(os.Stderr, "Fatal error: %v\n", err)
-	os.Exit(1)
-}
-
 // main updates error handling for Windows
 func main() {
 	cfg := NewConfig()
