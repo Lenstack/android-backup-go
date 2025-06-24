@@ -76,6 +76,7 @@ type FileStatus struct {
 // Cache manages failed operations, file statuses, and skip list.
 type Cache struct {
 	failedOps     map[string]int        // Operation key -> retry count
+	failedFiles   map[string]bool       // File paths for retry
 	fileStatus    map[string]FileStatus // File path -> status
 	maxRetries    int
 	mutex         sync.RWMutex
@@ -103,6 +104,7 @@ func NewCache(logPath, skipPath string, maxRetries int) (*Cache, error) {
 	}
 	cache := &Cache{
 		failedOps:     make(map[string]int),
+		failedFiles:   make(map[string]bool),
 		fileStatus:    make(map[string]FileStatus),
 		maxRetries:    maxRetries,
 		logFile:       logFile,
@@ -205,6 +207,13 @@ func (c *Cache) AddFailed(key, opType string, attempt int, err error, stderr str
 	}
 }
 
+// AddFailedFile marks a file for retry.
+func (c *Cache) AddFailedFile(path string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.failedFiles[path] = true
+}
+
 // AddFileStatus caches a file's status and logs errors.
 func (c *Cache) AddFileStatus(file FileStatus) {
 	c.mutex.Lock()
@@ -242,15 +251,13 @@ func (c *Cache) ShouldSkip(key string) bool {
 	return c.failedOps[key] >= c.maxRetries
 }
 
-// GetFailed returns a list of failed operations for retry.
-func (c *Cache) GetFailed() []string {
+// GetFailedFiles returns a list of failed file paths for retry.
+func (c *Cache) GetFailedFiles() []string {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 	var failed []string
-	for key, count := range c.failedOps {
-		if count > 0 && count <= c.maxRetries {
-			failed = append(failed, key)
-		}
+	for path := range c.failedFiles {
+		failed = append(failed, path)
 	}
 	return failed
 }
@@ -458,50 +465,97 @@ func (cfg *Config) listFiles(src string, cache *Cache) ([]string, error) {
 
 // listFilesSingleCtx lists files in a single directory with context and metadata caching.
 func (cfg *Config) listFilesSingleCtx(ctx context.Context, src string, cache *Cache) ([]string, error) {
-	cmd := exec.CommandContext(ctx, cfg.AdbPath, "shell", "find", src, "-type", "f", "-printf", "%p %s\n")
+	var files []string
+	var totalSize int64
+
+	// Try find command first
+	cmd := exec.CommandContext(ctx, cfg.AdbPath, "shell", "find", src, "-type", "f")
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 	err := cmd.Run()
-	deniedPaths := parsePermissionDeniedPaths(stderrBuf.String())
+	stderrStr := stderrBuf.String()
+	deniedPaths := parsePermissionDeniedPaths(stderrStr)
 	for _, path := range deniedPaths {
 		cache.AddFileStatus(FileStatus{Path: path, Error: true})
 		fmt.Fprintf(os.Stderr, "Warning: permission denied for %s, marked as unprocessable\n", path)
 	}
-	var files []string
-	var totalSize int64
-	scanner := bufio.NewScanner(strings.NewReader(stdoutBuf.String()))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
-			continue
-		}
-		file := parts[0]
-		size, _ := strconv.ParseInt(parts[1], 10, 64)
-		totalSize += size
-		hasError := cache.IsPathInSkipList(file)
-		cache.AddFileStatus(FileStatus{Path: file, Error: hasError})
-		if !hasError {
+
+	if err == nil {
+		scanner := bufio.NewScanner(strings.NewReader(stdoutBuf.String()))
+		for scanner.Scan() {
+			file := strings.TrimSpace(scanner.Text())
+			if file == "" || cache.IsPathInSkipList(file) {
+				continue
+			}
+			cache.AddFileStatus(FileStatus{Path: file, Error: false})
+			cache.AddFailedFile(file)
 			files = append(files, file)
 		}
+		if err := scanner.Err(); err != nil {
+			return files, fmt.Errorf("failed to scan files: %w", err)
+		}
+	} else if strings.Contains(stderrStr, "bad arg") || strings.Contains(stderrStr, "invalid predicate") {
+		// Fallback to ls -l
+		fmt.Fprintf(os.Stderr, "Warning: find command failed, falling back to ls -l for %s\n", src)
+		cmd = exec.CommandContext(ctx, cfg.AdbPath, "shell", "ls", "-l", src)
+		stdoutBuf.Reset()
+		stderrBuf.Reset()
+		cmd.Stdout = &stdoutBuf
+		cmd.Stderr = &stderrBuf
+		err = cmd.Run()
+		stderrStr = stderrBuf.String()
+		deniedPaths = parsePermissionDeniedPaths(stderrStr)
+		for _, path := range deniedPaths {
+			cache.AddFileStatus(FileStatus{Path: path, Error: true})
+			fmt.Fprintf(os.Stderr, "Warning: permission denied for %s, marked as unprocessable\n", path)
+		}
+		if err != nil {
+			cache.AddFailed("ls-files-"+src, "Command", 1, err, stderrStr)
+			fmt.Fprintf(os.Stderr, "Warning: ls -l failed for %s: %v, stderr: %s\n", src, err, stderrStr)
+			return files, nil
+		}
+		scanner := bufio.NewScanner(strings.NewReader(stdoutBuf.String()))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			parts := strings.Fields(line)
+			if len(parts) < 8 {
+				continue
+			}
+			if parts[0][0] != '-' { // Skip directories
+				continue
+			}
+			fileName := strings.Join(parts[7:], " ")
+			filePath := filepath.Join(src, fileName)
+			if cache.IsPathInSkipList(filePath) {
+				continue
+			}
+			cache.AddFileStatus(FileStatus{Path: filePath, Error: false})
+			cache.AddFailedFile(filePath)
+			files = append(files, filePath)
+			if size, err := strconv.ParseInt(parts[4], 10, 64); err == nil {
+				totalSize += size
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return files, fmt.Errorf("failed to scan ls output: %w", err)
+		}
+	} else {
+		cache.AddFailed("list-files-"+src, "Command", 1, err, stderrStr)
+		fmt.Fprintf(os.Stderr, "Warning: errors encountered listing files in %s: %v, stderr: %s\n", src, err, stderrStr)
+		return files, nil
 	}
-	if err := scanner.Err(); err != nil {
-		return files, fmt.Errorf("failed to scan files: %w", err)
-	}
+
+	// Adjust batch size based on total size (if available)
 	if totalSize > 1<<30 { // 1GB
 		cfg.BatchSize = max(cfg.BatchSize/2, 10)
 	} else if totalSize < 1<<27 { // 128MB
 		cfg.BatchSize = min(cfg.BatchSize*2, 1000)
 	}
-	if err != nil {
-		cache.AddFailed("list-files-"+src, "Command", 1, err, stderrBuf.String())
-		fmt.Fprintf(os.Stderr, "Warning: errors encountered listing files in %s: %v, stderr: %s\n", src, err, stderrBuf.String())
-		return files, nil
-	}
+
 	return files, nil
 }
 
@@ -524,10 +578,15 @@ func min(a, b int) int {
 // parsePermissionDeniedPaths extracts permission-denied paths from stderr.
 func parsePermissionDeniedPaths(stderr string) []string {
 	var paths []string
-	re := regexp.MustCompile(`find:\s*(.*?):\s*Permission denied`)
+	re := regexp.MustCompile(`find:\s*(.*?):\s*Permission denied|ls:\s*(.*?):\s*Permission denied`)
 	matches := re.FindAllStringSubmatch(stderr, -1)
 	for _, match := range matches {
-		if len(match) > 1 {
+		if len(match) > 2 && match[2] != "" {
+			path := strings.TrimSpace(match[2])
+			if path != "" {
+				paths = append(paths, path)
+			}
+		} else if len(match) > 1 && match[1] != "" {
 			path := strings.TrimSpace(match[1])
 			if path != "" {
 				paths = append(paths, path)
@@ -582,12 +641,24 @@ func (cfg *Config) copyFilesBatch(files []string, dst, rootSrc string, cache *Ca
 	}()
 	var relativeFiles []string
 	for _, file := range files {
+		if strings.HasPrefix(file, "list-files-") {
+			fmt.Fprintf(os.Stderr, "Warning: skipping invalid file path %s\n", file)
+			continue
+		}
+		if _, err := SanitizePath(file); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: invalid file path %s: %v, skipping\n", file, err)
+			continue
+		}
 		relPath, err := filepath.Rel(rootSrc, file)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to relativize %s: %v, skipping\n", file, err)
 			continue
 		}
 		relativeFiles = append(relativeFiles, relPath)
+	}
+	if len(relativeFiles) == 0 {
+		fmt.Fprintf(os.Stderr, "Warning: no valid files to archive in batch, skipping\n")
+		return nil
 	}
 	fileList := strings.Join(relativeFiles, "\n")
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TimeoutCopy)
@@ -649,6 +720,9 @@ func (cfg *Config) copyFilesBatch(files []string, dst, rootSrc string, cache *Ca
 		return errors.Join(lastExtractErr, cleanupErr)
 	}
 	for _, file := range files {
+		if strings.HasPrefix(file, "list-files-") {
+			continue
+		}
 		relPath, err := filepath.Rel(rootSrc, file)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to relativize %s: %v, using basename\n", file, err)
@@ -762,7 +836,7 @@ func (cfg *Config) copyFromDevice(cache *Cache) error {
 			}(batch)
 		}
 		wg.Wait()
-		failed := cache.GetFailed()
+		failed := cache.GetFailedFiles()
 		if len(failed) > 0 {
 			fmt.Printf("Retrying %d failed files\n", len(failed))
 			for i := 0; i < len(failed); i += cfg.BatchSize {
