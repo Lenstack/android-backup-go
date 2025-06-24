@@ -22,6 +22,7 @@ import (
 type Config struct {
 	AdbPath        string
 	BackupDir      string
+	TemporaryDir   string
 	TimeoutList    time.Duration
 	TimeoutCopy    time.Duration
 	TimeoutCleanup time.Duration
@@ -267,6 +268,7 @@ func NewConfig() *Config {
 	cfg := &Config{
 		AdbPath:        "platform-tools/adb.exe",
 		BackupDir:      "backups",
+		TemporaryDir:   "/sdcard/tmp",
 		TimeoutList:    30 * time.Second,
 		TimeoutCopy:    2 * time.Hour,
 		TimeoutCleanup: 10 * time.Second,
@@ -611,20 +613,20 @@ func SanitizePath(path string) (string, error) {
 
 // ensureTempDir creates and verifies a writable temporary directory on the device.
 func (cfg *Config) ensureTempDir(cache *Cache) (string, error) {
-	tempDir := "/sdcard/tmp"
+
 	// Create the directory
 	_, stderr, err := cfg.run(AdbCommand{
-		Args:    []string{"shell", "mkdir", "-p", tempDir},
+		Args:    []string{"shell", "mkdir", "-p", cfg.TemporaryDir},
 		Timeout: cfg.TimeoutList,
-		Key:     "mkdir-" + tempDir,
+		Key:     "mkdir-" + cfg.TemporaryDir,
 		Type:    "Command",
-		Path:    tempDir,
+		Path:    cfg.TemporaryDir,
 	}, cache)
 	if err != nil {
-		return "", fmt.Errorf("failed to create temporary directory %s: %w, stderr: %s; check device storage permissions", tempDir, err, stderr)
+		return "", fmt.Errorf("failed to create temporary directory %s: %w, stderr: %s; check device storage permissions", cfg.TemporaryDir, err, stderr)
 	}
 	// Verify writability with a test file
-	testFile := filepath.Join(tempDir, "test_writable")
+	testFile := filepath.Join(cfg.TemporaryDir, "test_writable")
 	_, stderr, err = cfg.run(AdbCommand{
 		Args:    []string{"shell", "touch", testFile},
 		Timeout: cfg.TimeoutList,
@@ -633,7 +635,7 @@ func (cfg *Config) ensureTempDir(cache *Cache) (string, error) {
 		Path:    testFile,
 	}, cache)
 	if err != nil {
-		return "", fmt.Errorf("temporary directory %s is not writable: %w, stderr: %s; ensure /sdcard has write permissions", tempDir, err, stderr)
+		return "", fmt.Errorf("temporary directory %s is not writable: %w, stderr: %s; ensure has write permissions", cfg.TemporaryDir, err, stderr)
 	}
 	// Clean up test file
 	cfg.run(AdbCommand{
@@ -643,7 +645,7 @@ func (cfg *Config) ensureTempDir(cache *Cache) (string, error) {
 		Type:    "Command",
 		Path:    testFile,
 	}, cache)
-	return tempDir, nil
+	return cfg.TemporaryDir, nil
 }
 
 // copyFilesBatch copies a batch of files using compressed tar with Windows compatibility.
